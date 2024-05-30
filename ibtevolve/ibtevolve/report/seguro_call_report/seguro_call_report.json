@@ -1,0 +1,26 @@
+{
+ "add_total_row": 0, 
+ "apply_user_permissions": 1, 
+ "creation": "2018-08-31 15:44:24.970912", 
+ "disabled": 0, 
+ "docstatus": 0, 
+ "doctype": "Report", 
+ "idx": 0, 
+ "is_standard": "Yes", 
+ "modified": "2018-08-31 15:44:24.970912", 
+ "modified_by": "Administrator", 
+ "module": "Ibtevolve", 
+ "name": "Seguro Call Report", 
+ "owner": "Administrator", 
+ "ref_doctype": "Seguro", 
+ "report_name": "Seguro Call Report", 
+ "report_type": "Script Report", 
+ "roles": [
+  {
+   "role": "System Manager"
+  }, 
+  {
+   "role": "Call Center Team"
+  }
+ ]
+}

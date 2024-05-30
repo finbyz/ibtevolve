@@ -1,0 +1,19 @@
+.input-group{ display: none }
+.dropdown-help li:last-child {
+    display: none;
+}
+.dropdown-help li:nth-child(-n+7)
+{
+	display:none;
+}
+
+ a[data-type=help] {
+  display:none;
+} 
+/* 
+.module-section-column:has(a){
+	display:none;
+} */
+.testready {
+	display:none;
+}

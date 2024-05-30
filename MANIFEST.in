@@ -1,0 +1,18 @@
+include MANIFEST.in
+include requirements.txt
+include *.json
+include *.md
+include *.py
+include *.txt
+recursive-include ibtevolve *.css
+recursive-include ibtevolve *.csv
+recursive-include ibtevolve *.html
+recursive-include ibtevolve *.ico
+recursive-include ibtevolve *.js
+recursive-include ibtevolve *.json
+recursive-include ibtevolve *.md
+recursive-include ibtevolve *.png
+recursive-include ibtevolve *.py
+recursive-include ibtevolve *.svg
+recursive-include ibtevolve *.txt
+recursive-exclude ibtevolve *.pyc
