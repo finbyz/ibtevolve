@@ -2,9 +2,37 @@ import frappe
 
 def attachments_api(doc, method):
 
-    if doc.complaint_status != "Closed":
+    recipient_email = []
+
+    def extract_emails(raw_emails):
+        """Split comma/semicolon-separated emails, strip spaces, and ignore blanks."""
+        if not raw_emails:
+            return []
+        # support comma or semicolon
+        parts = [e.strip() for e in raw_emails.replace(";", ",").split(",") if e.strip()]
+        # simple validation - must contain "@"
+        valid_emails = [e for e in parts if "@" in e]
+        return valid_emails
+
+    if doc.reason_for_contact == "General Inquiry" and doc.general_inquiry_email:
+        recipient_email.extend(extract_emails(doc.general_inquiry_email))
+
+    if (
+        doc.reason_for_contact == "Feedback and Complaint"
+        and doc.complaint_status == "Escalated to Americana"
+        and doc.email
+    ):
+        recipient_email.extend(extract_emails(doc.email))
+
+    # ✅ Exit early if no recipients
+    if not recipient_email:
+        frappe.log_error(
+            f"No recipients found for {doc.name}. Email not sent.",
+            "Americana Notification"
+        )
         return
-    
+
+
     attached_files = frappe.get_all(
     "File",
     filters={
@@ -39,7 +67,7 @@ def attachments_api(doc, method):
                 email_attachments.append({
                     "file_url": file_url
                 })
-
+    
     # Fetch Email Template
     template_name = "Americana  Notification"
     try:
@@ -67,24 +95,26 @@ def attachments_api(doc, method):
         if email_account.enable_outgoing == 1 and email_account.awaiting_password == 0:
             sender_email = email_account.email_id
     except Exception:
-        pass
+        frappe.log_error("Email Account 'Americana IBT' not found or invalid config")
 
     # recipient_email = {doc.raised_by}
-    recipient_email = "bhagyashri.patil@finbyz.tech" 
-        
-    frappe.log_error(f"Preparing to send email with {len(email_attachments)} attachments")
+           
+    try:
+        frappe.sendmail(
+            recipients=recipient_email,
+            sender=sender_email,
+            subject=subject,
+            message=message_body,
+            attachments=email_attachments,
+            reference_doctype=doc.doctype,
+            reference_name=doc.name,
+        )
+        frappe.msgprint(f"✅ Email sent successfully to: {', '.join(recipient_email)}")
+    except Exception as e:
+        frappe.log_error(f"Error sending email: {str(e)}", "Americana Notification Error")
+        frappe.msgprint("❌ Failed to send email. Check Error Log.")
 
-    frappe.sendmail(
-        recipients=[recipient_email],
-        sender=sender_email,
-        subject=subject,
-        message=message_body,
-        attachments=email_attachments,
-        reference_doctype=doc.doctype,
-        reference_name=doc.name
-    )
-
-    frappe.msgprint("Email sent successfully using Email Template!")
+    frappe.log_error(f"Sent Americana Notification for {doc.name}", "Americana Notification")
 
     # subject = f"NEW {doc.reason_for_contact.upper()} for {doc.product.upper()} - {doc.name}"
 

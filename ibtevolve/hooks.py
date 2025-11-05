@@ -90,8 +90,8 @@ app_include_css = "/assets/css/ibtcustom.min.css"
 
 doc_events = {
     "Americana": {
-        "on_update": "ibtevolve.doc_events.americana.attachments_api",
-        # "before_submit": "ibtevolve.doc_events.americana.attachments_api"
+        # "on_update": "ibtevolve.doc_events.americana.attachments_api",
+        "before_submit": "ibtevolve.doc_events.americana.attachments_api"
     }
 }
 
