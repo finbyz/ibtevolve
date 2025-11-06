@@ -69,7 +69,12 @@ def attachments_api(doc, method):
                 })
     
     # Fetch Email Template
-    template_name = "Americana  Notification"
+    if doc.reason_for_contact == "General Inquiry":
+        template_name = "Americana General Inquiry Notification"
+
+    if doc.reason_for_contact == "Feedback and Complaint":
+        template_name = "Americana Feedback and Complaint Notification"
+        
     try:
         template = frappe.get_doc("Email Template", template_name)
     except frappe.DoesNotExistError:
