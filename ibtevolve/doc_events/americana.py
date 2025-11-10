@@ -24,6 +24,11 @@ def attachments_api(doc, method):
     ):
         recipient_email.extend(extract_emails(doc.email))
 
+     # ✅ Add CC emails (if present)
+    cc_list = []
+    if getattr(doc, "cc_email", None):
+        cc_list = extract_emails(doc.cc_email)
+
     # ✅ Exit early if no recipients
     if not recipient_email:
         frappe.log_error(
@@ -107,6 +112,7 @@ def attachments_api(doc, method):
     try:
         frappe.sendmail(
             recipients=recipient_email,
+            cc = cc_list,
             sender=sender_email,
             subject=subject,
             message=message_body,
