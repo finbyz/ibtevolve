@@ -14,7 +14,7 @@ def attachments_api(doc, method):
         valid_emails = [e for e in parts if "@" in e]
         return valid_emails
 
-    if doc.reason_for_contact == "General Inquiry" and doc.general_inquiry_email:
+    if doc.reason_for_contact == "General Inquiry" and doc.general_inquiry_email and email_to_be_sent == "Yes":
         recipient_email.extend(extract_emails(doc.general_inquiry_email))
 
     if (
