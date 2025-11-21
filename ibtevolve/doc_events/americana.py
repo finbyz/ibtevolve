@@ -98,6 +98,7 @@ def attachments_api(doc, method):
         "document_url": document_url
     })
 
+   
     # Email account
     sender_email = "noreply@example.com"
     try:
@@ -111,14 +112,15 @@ def attachments_api(doc, method):
            
     try:
         frappe.sendmail(
-            recipients=recipient_email,
-            cc = cc_list,
+            recipients=", ".join(recipient_email),
+            cc = ", ".join(cc_list) if cc_list else None,
             sender=sender_email,
             subject=subject,
             message=message_body,
             attachments=email_attachments,
             reference_doctype=doc.doctype,
             reference_name=doc.name,
+            expose_recipients="header",
         )
         frappe.msgprint(f"✅ Email sent successfully to: {', '.join(recipient_email)}")
     except Exception as e:
