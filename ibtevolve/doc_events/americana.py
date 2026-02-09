@@ -102,7 +102,7 @@ def attachments_api(doc, method):
     # Email account
     sender_email = "noreply@example.com"
     try:
-        email_account = frappe.get_doc("Email Account", "Info Americana Food")
+        email_account = frappe.get_doc("Email Account", "Americana IBT")
         if email_account.enable_outgoing == 1 and email_account.awaiting_password == 0:
             sender_email = email_account.email_id
     except Exception:
