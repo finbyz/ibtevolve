@@ -7,6 +7,7 @@ import mimetypes
 import urllib.parse
 import requests
 
+import frappe
 
 SITE_IMG_RE = re.compile(
     r'src=["\']https://ibtevolve\.frappe\.cloud/files/([^"\']+)["\']'
@@ -14,9 +15,6 @@ SITE_IMG_RE = re.compile(
 
 
 def inject_mbrl_signature(doc, method=None):
-    if "MBRL Helpdesk" not in (doc.sender or ""):
-        return
-
     msg = message_from_string(doc.message)
 
     alt_part = None
@@ -51,12 +49,26 @@ def inject_mbrl_signature(doc, method=None):
     sig_html = (plain_part.get_payload(decode=True) or b"").decode("utf-8", errors="ignore")
     sig_html = sig_html.replace("`", "")
 
-    # Find signature table by ID
-    sig_match = re.search(r'(<table[^>]+id=["\']email-signature["\'][^>]*>.*?</table>)', sig_html, re.IGNORECASE | re.DOTALL)
-    if not sig_match:
+    # Find the opening tag of the signature table by its ID
+    start_match = re.search(r'<table[^>]+id=["\']email-signature["\'][^>]*>', sig_html, re.IGNORECASE)
+    if not start_match:
         return
 
-    sig_html = sig_match.group(1)
+    start = start_match.start()
+    depth = 0
+
+    # Walk all <table> / </table> tags from that point, tracking nesting depth
+    for m in re.finditer(r'</?table(?:\s|>)', sig_html[start:], re.IGNORECASE):
+        if m.group(0).startswith('</'):
+            depth -= 1
+            if depth == 0:                          # found the matching closing tag
+                sig_html = sig_html[start: start + m.end()]
+                break
+        else:
+            depth += 1
+    else:
+        return  # malformed / unmatched table — bail out
+
     body_html = (html_part.get_payload(decode=True) or b"").decode(
         html_part.get_content_charset() or "utf-8", errors="ignore"
     )
@@ -69,7 +81,7 @@ def inject_mbrl_signature(doc, method=None):
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # CID embed: download from Frappe Cloud (works for S3/cloud storage)
+    # CID embed: download images from Frappe Cloud
     image_parts = []
 
     def replace_with_cid(match):
@@ -129,3 +141,4 @@ def inject_mbrl_signature(doc, method=None):
         ])
 
     doc.message = msg.as_string()
+
