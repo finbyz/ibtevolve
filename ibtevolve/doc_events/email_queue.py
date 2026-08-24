@@ -49,9 +49,14 @@ def inject_mbrl_signature(doc, method=None):
         return
 
     sig_html = (plain_part.get_payload(decode=True) or b"").decode("utf-8", errors="ignore")
-    if "<table" not in sig_html.lower():
+    sig_html = sig_html.replace("`", "")
+
+    # Find signature table by ID
+    sig_match = re.search(r'(<table[^>]+id=["\']email-signature["\'][^>]*>.*?</table>)', sig_html, re.IGNORECASE | re.DOTALL)
+    if not sig_match:
         return
 
+    sig_html = sig_match.group(1)
     body_html = (html_part.get_payload(decode=True) or b"").decode(
         html_part.get_content_charset() or "utf-8", errors="ignore"
     )
