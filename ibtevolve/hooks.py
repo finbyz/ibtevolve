@@ -92,7 +92,8 @@ doc_events = {
     "Americana": {
         # "on_update": "ibtevolve.doc_events.americana.attachments_api",
         "before_submit": "ibtevolve.doc_events.americana.attachments_api"
-    }
+    },
+    "Email Queue": "ibtevolve.doc_events.email_queue.inject_mbrl_signature"
 }
 
 # Scheduled Tasks
