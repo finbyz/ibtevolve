@@ -48,6 +48,12 @@ def inject_mbrl_signature(doc, method=None):
 
     sig_html = (plain_part.get_payload(decode=True) or b"").decode("utf-8", errors="ignore")
     sig_html = sig_html.replace("`", "")
+    sig_html = re.sub(
+    r"<br\s*/?>",
+    "<br>",
+    sig_html,
+    flags=re.IGNORECASE
+    )
 
     # Find the opening tag of the signature table by its ID
     start_match = re.search(r'<table[^>]+id=["\']email-signature["\'][^>]*>', sig_html, re.IGNORECASE)
