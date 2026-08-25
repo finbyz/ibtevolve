@@ -15,7 +15,7 @@ SITE_IMG_RE = re.compile(
 
 
 def inject_mbrl_signature(doc, method=None):
-    if "MBRL Helpdesk" in doc.sender:
+    if "MBRL Helpdesk" not in doc.sender:
         return
     msg = message_from_string(doc.message)
 
