@@ -1,48 +1,37 @@
 import frappe
-from erpnext.crm.utils import link_communications,get_linked_communication_list
+from erpnext.crm.utils import link_communications
+
+
+def _is_valid_inbound(doc):
+    return (
+        doc.communication_type == "Communication"
+        and doc.reference_doctype == "MBRL"
+        and doc.sent_or_received == "Received"
+        and "info@mbrl.ae" in (doc.recipients or "").lower()
+        and (doc.sender or "").lower().strip() != "info@mbrl.ae"
+    )
 
 def create_mbrl(self, method):
-    # Only process Communication documents linked with MBRL
-    if self.communication_type not in ["Communication"]:
+    if not _is_valid_inbound(self):
         return
 
-    if self.reference_doctype != "MBRL":
-        return
+    mbrl_doc = frappe.get_doc(self.reference_doctype, self.reference_name)
 
-    if self.sent_or_received != "Received":
-        return
-
-    recipients = (self.recipients or "").lower()
-    if "info@mbrl.ae" not in recipients:
-        return
-
-    sender = (self.sender or "").lower().strip()
-    if sender == "info@mbrl.ae":
-        return
-
-    mbrl_doc = frappe.get_doc(
-        self.reference_doctype,
-        self.reference_name
+    draft = frappe.db.get_value(
+        "MBRL",
+        {"new_ticket": 1, "customer_email": mbrl_doc.customer_email, "docstatus": 0},
+        "name",
     )
+    if draft:
+        self.add_link("MBRL", draft, autosave=True)  # self untouched here, safe
+        return
 
     if mbrl_doc.docstatus != 1:
         return
-    data = frappe.get_all("MBRL", filters={"new_ticket": 1, "customer_name": mbrl_doc.customer_name}, fields=["name","docstatus"])
-    
-    for row in data:
-        if row.docstatus == 0:
-            communication_list = get_linked_communication_list("MBRL", row.name)
-            for communication in communication_list:
-                if self.name not in communication_list:
-                    communication_doc = frappe.get_doc("Communication", communication)
-                    communication_doc.add_link(mbrl_doc.doctype, mbrl_doc.name, autosave=True)
-            return
 
     new_mbrl = frappe.copy_doc(mbrl_doc)
     new_mbrl.new_ticket = 1
     new_mbrl.save(ignore_permissions=True)
-    link_communications(
-        "MBRL",
-        mbrl_doc.name,
-        new_mbrl
-    )
+
+    link_communications("MBRL", mbrl_doc.name, new_mbrl)  # handles self too
+    

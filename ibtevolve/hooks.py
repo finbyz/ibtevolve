@@ -97,7 +97,7 @@ doc_events = {
         "before_insert": "ibtevolve.doc_events.email_queue.inject_mbrl_signature"
     },
     "Communication": {
-        "before_insert": "ibtevolve.doc_events.communication.create_mbrl"
+        "after_insert": ["ibtevolve.doc_events.communication.create_mbrl"],
     }
 }
 
