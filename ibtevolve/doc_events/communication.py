@@ -1,5 +1,5 @@
 import frappe
-from erpnext.crm.utils import link_communications
+from erpnext.crm.utils import link_communications,get_linked_communication_list
 
 def create_mbrl(self, method):
     # Only process Communication documents linked with MBRL
@@ -31,7 +31,11 @@ def create_mbrl(self, method):
     
     for row in data:
         if row.docstatus == 0:
-            frappe.log_error(f"An MBRL document with new_ticket=1 already exists for customer {mbrl_doc.customer_name}. Skipping MBRL creation.", "MBRL Creation Error")
+            communication_list = get_linked_communication_list("MBRL", row.name)
+            for communication in communication_list:
+                if self.name not in communication_list:
+                    communication_doc = frappe.get_doc("Communication", communication)
+                    communication_doc.add_link(mbrl_doc.doctype, mbrl_doc.name, autosave=True)
             return
 
     new_mbrl = frappe.copy_doc(mbrl_doc)
@@ -42,6 +46,3 @@ def create_mbrl(self, method):
         mbrl_doc.name,
         new_mbrl
     )
-
-    
-            
