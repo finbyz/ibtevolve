@@ -104,7 +104,7 @@ doc_events = {
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
+scheduler_events = {
 # 	"all": [
 # 		"ibtevolve.tasks.all"
 # 	],
@@ -120,7 +120,13 @@ doc_events = {
 # 	"monthly": [
 # 		"ibtevolve.tasks.monthly"
 # 	]
-# }
+
+    "cron": {
+        "*/5 * * * *": [
+            "ibtevolve.doc_events.repot_email_schedule.process_scheduled_reports"
+        ]
+    }
+}
 
 # Testing
 # -------
