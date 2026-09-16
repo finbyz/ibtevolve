@@ -244,50 +244,110 @@ class ReportEmailScheduled(Document):
     def get_filters(self):
         """
         Build a dictionary of filters from the child table, and override/add
-        specific filters from the main document if they have values.
+        specific filters from the main document — but ONLY for filters the
+        underlying report actually exposes.
+
+        Filters not declared by the report are dropped (with a log line) so we
+        don't blow up reports like 'Americana Agent Report' that have no
+        `company` column in their query.
         """
         filter_dict = {}
-        
-        # 1. Preserve your original child table logic
-        filters_table = self.get("filters")
-        if filters_table:
-            for row in filters_table:
-                # Ensure we have both a fieldname and a value
-                if row.get("fieldname") and row.get("value") is not None:
-                    filter_dict[row.get("fieldname")] = row.get("value")
 
-        # 2. Update specific filters ONLY if the main document has a value
+        # Discover which filters the report supports.
+        #   None  -> we couldn't determine, pass everything through (back-compat)
+        #   set() -> report declares none, drop everything not in the child table
+        supported = self._get_supported_filters()
+        restrict = supported is not None
+
+        def _add(fieldname, value):
+            if restrict and fieldname not in supported:
+                logger.info(
+                    f"Skipping unsupported filter '{fieldname}' | "
+                    f"report={self.report} | name={self.name}"
+                )
+                return
+            filter_dict[fieldname] = value
+
+        # 1. Child-table filters (only if the report supports them)
+        for row in self.get("filters") or []:
+            fieldname = row.get("fieldname")
+            if not fieldname or row.get("value") is None:
+                continue
+            _add(fieldname, row.get("value"))
+
+        # 2. Main-document filters — gated by what the report declares
         if self.get("company"):
-            filter_dict["company"] = self.company
-            
-        if self.get("customer"):
-            filter_dict["customer"] = self.customer
+            _add("company", self.company)
 
-        # 3. Handle the "Date range" field and map it to from_date & to_date
+        if self.get("customer"):
+            _add("customer", self.customer)
+
+        # 3. Date range -> from_date / to_date, gated on the same check
         if self.get("date_range"):
             date_val = self.date_range
-            
-            # Case A: The UI shows "Today" (or similar dynamic values)
+
             if date_val == "Today":
                 today = frappe.utils.today()
-                filter_dict["from_date"] = today
-                filter_dict["to_date"] = today
-                
-            # Case B: Standard Frappe Date Range returns a comma-separated string "YYYY-MM-DD,YYYY-MM-DD"
+                _add("from_date", today)
+                _add("to_date", today)
             elif isinstance(date_val, str) and "," in date_val:
                 from_date, to_date = date_val.split(",")
-                filter_dict["from_date"] = from_date.strip()
-                filter_dict["to_date"] = to_date.strip()
-                
-            # Case C: Fallback if it's a single date string
+                _add("from_date", from_date.strip())
+                _add("to_date", to_date.strip())
             else:
-                filter_dict["from_date"] = date_val
-                filter_dict["to_date"] = date_val
+                _add("from_date", date_val)
+                _add("to_date", date_val)
 
         logger.info(
-            f"Filters built for schedule | name={self.name} | filters={filter_dict}"
+            f"Filters built for schedule | name={self.name} | "
+            f"report={self.report} | filters={filter_dict}"
         )
         return filter_dict
+
+
+    def _get_supported_filters(self):
+        """
+        Return the set of `fieldname`s declared by the report's filter panel.
+
+        Returns ``None`` when we truly cannot determine them, so callers fall
+        back to passing filters through unchanged (safe back-compat).
+
+        Returns an empty ``set()`` when the report genuinely declares no filters.
+        """
+        try:
+            report_type = frappe.db.get_value("Report", self.report, "report_type")
+
+            # This is the parser you already ship in this module.
+            definitions = get_report_filters(self.report) or []
+
+            # Script Reports keep their filters in JS. An empty parse result is
+            # ambiguous ("no filters" vs "couldn't read the JS"), so stay
+            # permissive instead of silently stripping valid filters.
+            if not definitions and report_type == "Script Report":
+                logger.warning(
+                    f"Could not read filters for Script Report {self.report} | "
+                    f"name={self.name} — passing filters through unchanged"
+                )
+                return None
+
+            fieldnames = {
+                d.get("fieldname")
+                for d in definitions
+                if isinstance(d, dict) and d.get("fieldname")
+            }
+
+            logger.info(
+                f"Supported filters resolved | name={self.name} | "
+                f"report={self.report} | supported={sorted(fieldnames)}"
+            )
+            return fieldnames
+
+        except Exception:
+            logger.exception(
+                f"Failed to resolve supported filters | name={self.name} | "
+                f"report={self.report} — passing filters through unchanged"
+            )
+            return None
 
     # ---------- Safe database update with retries and lock handling ----------
     def _safe_set_value(self, *args, retries=5, delay=0.5):
@@ -881,18 +941,34 @@ def _apply_defaults(report_name, filters, definitions, extra_defaults=None):
         -> REPORT_SPECIFIC_DEFAULTS
         -> extra_defaults passed to this call
         -> filters passed by the caller (never overwritten)
+
+    Generic and report-specific defaults are only applied for fieldnames
+    that the report actually declares (i.e. present in ``definitions``).
+    Injecting, say, ``company`` into a Query Report whose SQL has no
+    ``company`` column raises
+    ``Unknown column 'tabX.company' in 'WHERE'`` at execution time.
     """
+    declared = set(definitions.keys())
+
     layer = {}
 
-    layer.update(COMMON_FILTER_DEFAULTS)
+    # 1. Generic defaults — gated by the report's declared filters
+    for fieldname, value in COMMON_FILTER_DEFAULTS.items():
+        if fieldname in declared:
+            layer[fieldname] = value
 
+    # 2. Defaults declared on the Report doc itself
     for fieldname, definition in definitions.items():
         default = definition.get("default")
         if default not in (None, ""):
             layer[fieldname] = default
 
-    layer.update(REPORT_SPECIFIC_DEFAULTS.get(report_name) or {})
+    # 3. Report-specific defaults — gated as well
+    for fieldname, value in (REPORT_SPECIFIC_DEFAULTS.get(report_name) or {}).items():
+        if fieldname in declared:
+            layer[fieldname] = value
 
+    # 4. Caller-supplied extra defaults — explicit intent, honour as-is
     layer.update(extra_defaults or {})
 
     for fieldname, value in layer.items():
