@@ -24,6 +24,9 @@
   "last_execution",
   "column_break_utokn",
   "recipients",
+  "cc",
+  "section_break_kyykh",
+  "email_message",
   "naming_series"
  ],
  "fields": [
@@ -121,11 +124,25 @@
    "fieldtype": "Link",
    "label": "Company",
    "options": "Company"
+  },
+  {
+   "fieldname": "cc",
+   "fieldtype": "Small Text",
+   "label": "CC"
+  },
+  {
+   "fieldname": "section_break_kyykh",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "email_message",
+   "fieldtype": "Text Editor",
+   "label": "Email Message"
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-11 12:08:02.398948",
+ "modified": "2026-09-16 12:53:22.641529",
  "modified_by": "Administrator",
  "module": "Ibtevolve",
  "name": "Report Email Scheduled",

@@ -77,6 +77,16 @@ class ReportEmailScheduled(Document):
                 frappe.throw("Please enter Day of Month.")
             if not 1 <= int(self.day_of_month) <= 31:
                 frappe.throw("Day of Month must be between 1 and 31.")
+                
+        # --- optional: validate CC addresses --------------------------------
+        if self.get("cc"):
+            from frappe.utils import validate_email_address
+
+            for addr in self.get_cc():
+                try:
+                    validate_email_address(addr, throw=True)
+                except Exception:
+                    frappe.throw(f"Invalid CC address: {addr}")
 
     def set_next_execution(self):
         
@@ -102,55 +112,6 @@ class ReportEmailScheduled(Document):
         self.next_execution = self.get_next_execution(now)
 
         
-    def get_next_execution(self, from_datetime=None):
-        from_datetime = from_datetime or now_datetime()
-
-        logger.info(
-            f"Calculating next execution | "
-            f"name={self.name} | "
-            f"frequency={self.frequency} | "
-            f"from={from_datetime}"
-        )
-
-        time_str = str(self.time)
-        hour, minute, second = map(int, time_str.split(":"))
-
-        execution_time = from_datetime.replace(
-            hour=hour,
-            minute=minute,
-            second=second,
-            microsecond=0,
-        )
-
-        # If calculated execution time has already passed,
-        # move it to the next execution
-        if execution_time <= from_datetime:
-            if self.frequency == "Daily":
-                execution_time += timedelta(days=1)
-
-            elif self.frequency == "Weekly":
-                execution_time += timedelta(days=7)
-
-            elif self.frequency == "Monthly":
-                # Move to next month
-                if execution_time.month == 12:
-                    execution_time = execution_time.replace(
-                        year=execution_time.year + 1,
-                        month=1
-                    )
-                else:
-                    execution_time = execution_time.replace(
-                        month=execution_time.month + 1
-                    )
-
-        logger.info(
-            f"Next execution calculated | "
-            f"name={self.name} | "
-            f"next_execution={execution_time}"
-        )
-
-        return execution_time
-
     def get_next_execution(self, from_datetime=None):
         from_datetime = from_datetime or now_datetime()
 
@@ -389,80 +350,10 @@ class ReportEmailScheduled(Document):
                     continue
                 # Otherwise re-raise
                 raise
-    # ----------------------------------------------------------------------
-
-    def send_scheduled_report(self):
-        if not self.enable:
-            logger.info(f"Schedule disabled. Skipping | name={self.name}")
-            return
-
-        # Extend session timeouts
-        try:
-            frappe.db.sql("SET SESSION wait_timeout = 7200")
-            frappe.db.sql("SET SESSION interactive_timeout = 7200")
-        except Exception as e:
-            logger.warning(f"Could not set session timeouts: {e}")
-
-        filters = self.get_filters()
-
-        logger.info(
-            f"Starting report execution | "
-            f"name={self.name} | report={self.report} | filters={filters}"
-        )
-        data = get_report_data(self.report)
-
-        export_result = data["data"]
-
-        if export_result is None:
-            frappe.log_error("No data returned for report", self.report)
-            # Commit any pending transaction before updating last_execution
-            try:
-                frappe.db.commit()
-            except Exception:
-                pass
-            self._safe_set_value(self.doctype, self.name, "last_execution", now_datetime())
-            return
-
-        report_name, extension, content = export_result
-
-        logger.info(
-            f"Report exported | "
-            f"name={self.name} | report_name={report_name} | "
-            f"extension={extension} | size={len(content) if content else 0}"
-        )
-
-        self.send_report_email(report_name, extension, content)
-
-        logger.info(f"Email sent successfully | name={self.name}")
-
-        execution_time = now_datetime()
-        next_execution = self.get_next_execution(execution_time)
-
-        # Commit before the final update to release any locks
-        try:
-            frappe.db.commit()
-        except Exception:
-            pass
-
-        self._safe_set_value(
-            self.doctype,
-            self.name,
-            {"last_execution": execution_time, "next_execution": next_execution},
-        )
-
-        # Final commit to make the changes permanent
-        try:
-            frappe.db.commit()
-        except Exception:
-            pass
-
-        logger.info(
-            f"Execution information updated | "
-            f"name={self.name} | last={execution_time} | next={next_execution}"
-        )
 
     def send_report_email(self, report_name, extension, content):
         recipients = self.get_recipients()
+        cc = self.get_cc()
 
         if not recipients:
             logger.error(f"No recipients found | name={self.name}")
@@ -470,32 +361,33 @@ class ReportEmailScheduled(Document):
 
         filename = f"{report_name}.{extension}"
 
-        logger.info(
-            f"Sending email | name={self.name} | filename={filename}"
-        )
+        message = (self.get("email_message") or "").strip()
+        if not message:
+            message = f"""
+                <p>Hello,</p>
+                <p>Please find the scheduled report <b>{self.report}</b> attached.</p>
+                <p>Regards,<br>ERPNext</p>
+            """
 
-        import logging
-        import cssutils
-        previous_level = cssutils.log.getEffectiveLevel()
-        cssutils.log.setLevel(logging.CRITICAL)
-        try:
-            frappe.sendmail(
-                recipients=recipients,
-                subject=f"Scheduled Report - {self.report}",
-                message=f"""
-                    <p>Hello,</p>
-                    <p>Please find the scheduled report <b>{self.report}</b> attached.</p>
-                    <p>Regards,<br>ERPNext</p>
-                """,
-                attachments=[{"fname": filename, "fcontent": content}],
-                reference_doctype=self.doctype,
-                reference_name=self.name,
-            )
-        finally:
-            cssutils.log.setLevel(previous_level)
+        sendmail_kwargs = {
+            "recipients": recipients,
+            "subject": f"Scheduled Report - {self.report}",
+            "message": message,
+            "attachments": [{"fname": filename, "fcontent": content}],
+            "reference_doctype": self.doctype,
+            "reference_name": self.name,
+            "expose_recipients": "header",
+        }
+        if cc:
+            sendmail_kwargs["cc"] = cc
+
+        frappe.sendmail(**sendmail_kwargs)
+
+        # Frappe merged cc into the recipients child table; undo that for display.
+        self._strip_cc_from_email_queue(cc)
 
         logger.info(f"Email send completed | name={self.name}")
-
+    
     def get_recipients(self):
         if not self.recipients:
             return []
@@ -626,6 +518,70 @@ class ReportEmailScheduled(Document):
             f"Execution information updated | name={self.name} | "
             f"last={execution_time} | next={next_execution}"
         )
+        
+    def get_cc(self):
+        """Parse the comma/newline separated `cc` field into a clean list."""
+        if not self.get("cc"):
+            return []
+
+        cc = self.cc.replace("\n", ",").split(",")
+        cc = [email.strip() for email in cc if email.strip()]
+
+        logger.info(
+            f"CC parsed | name={self.name} | count={len(cc)}"
+        )
+        return cc
+    
+    def _strip_cc_from_email_queue(self, cc):
+        """
+        Frappe v14's sendmail() unconditionally appends cc addresses to the
+        Email Queue's `recipients` child table. Remove them so the UI shows
+        only the To addresses there, while the `cc` field keeps the CC list.
+
+        Safe because expose_recipients="header" bakes the Cc: header into the
+        outgoing MIME message during message assembly, so the cc row in the
+        child table is redundant for delivery.
+        """
+        if not cc:
+            return
+
+        try:
+            eq_name = frappe.db.get_value(
+                "Email Queue",
+                {
+                    "reference_doctype": self.doctype,
+                    "reference_name": self.name,
+                },
+                "name",
+                order_by="creation desc",
+            )
+            if not eq_name:
+                logger.warning(f"No Email Queue found to strip CC | name={self.name}")
+                return
+
+            cc_lower = {c.strip().lower() for c in cc if c.strip()}
+
+            eq = frappe.get_doc("Email Queue", eq_name)
+            original = len(eq.recipients)
+            eq.recipients = [
+                row for row in eq.recipients
+                if (row.recipient or "").strip().lower() not in cc_lower
+            ]
+            removed = original - len(eq.recipients)
+
+            if removed:
+                eq.flags.ignore_permissions = True
+                eq.flags.ignore_validate_update_after_submit = True
+                eq.save(ignore_permissions=True)
+                frappe.db.commit()
+                logger.info(
+                    f"Stripped {removed} CC row(s) from Email Queue {eq_name} | "
+                    f"remaining={len(eq.recipients)}"
+                )
+        except Exception:
+            logger.exception(
+                f"Failed to strip CC from Email Queue | name={self.name} | cc={cc}"
+            )
         
         
         
@@ -1290,3 +1246,5 @@ def get_report_filters(report_name):
                 parsed_filters.append(f)
                 
         return parsed_filters
+    
+    
