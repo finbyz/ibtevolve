@@ -18,6 +18,7 @@ import cssutils
 # during frappe.sendmail(). Silence them here.
 cssutils.log.setLevel(logging.CRITICAL)
 
+
 logger = frappe.logger(
     "report_email_scheduled",
     allow_site=True,
@@ -204,19 +205,16 @@ class ReportEmailScheduled(Document):
 
     def get_filters(self):
         """
-        Build a dictionary of filters from the child table, and override/add
-        specific filters from the main document — but ONLY for filters the
-        underlying report actually exposes.
+        Build a flat dict of filters from the child table plus the schedule's
+        own company / customer / date_range fields.
 
-        Filters not declared by the report are dropped (with a log line) so we
-        don't blow up reports like 'Americana Agent Report' that have no
-        `company` column in their query.
+        Whether an individual filter survives depends on the report type — see
+        ``_get_supported_filters``.  In particular, Report Builder reports will
+        blow up with "Unknown column 'tabX.field'" if we hand them a column
+        that doesn't exist on their DocType.
         """
         filter_dict = {}
 
-        # Discover which filters the report supports.
-        #   None  -> we couldn't determine, pass everything through (back-compat)
-        #   set() -> report declares none, drop everything not in the child table
         supported = self._get_supported_filters()
         restrict = supported is not None
 
@@ -229,21 +227,24 @@ class ReportEmailScheduled(Document):
                 return
             filter_dict[fieldname] = value
 
-        # 1. Child-table filters (only if the report supports them)
+        # 1. Child-table filters
         for row in self.get("filters") or []:
             fieldname = row.get("fieldname")
             if not fieldname or row.get("value") is None:
                 continue
             _add(fieldname, row.get("value"))
 
-        # 2. Main-document filters — gated by what the report declares
+        # 2. Main-document filters
         if self.get("company"):
             _add("company", self.company)
 
         if self.get("customer"):
             _add("customer", self.customer)
+            
+        if self.get("group_by"):                      # <-- ADD THESE 2 LINES
+            filter_dict["group_by"] = self.group_by
 
-        # 3. Date range -> from_date / to_date, gated on the same check
+        # 3. Date range -> from_date / to_date
         if self.get("date_range"):
             date_val = self.date_range
 
@@ -261,47 +262,68 @@ class ReportEmailScheduled(Document):
 
         logger.info(
             f"Filters built for schedule | name={self.name} | "
-            f"report={self.report} | filters={filter_dict}"
+            f"report={self.report} | restrict={restrict} | filters={filter_dict}"
         )
         return filter_dict
 
 
     def _get_supported_filters(self):
         """
-        Return the set of `fieldname`s declared by the report's filter panel.
+        Return the set of filter fieldnames that can safely be passed to this
+        report, or ``None`` to be permissive.
 
-        Returns ``None`` when we truly cannot determine them, so callers fall
-        back to passing filters through unchanged (safe back-compat).
+        Report type matters because Frappe consumes filters differently:
 
-        Returns an empty ``set()`` when the report genuinely declares no filters.
+        * Script Report  -> ``filters.get("x")``; unknown keys are ignored.
+                            JS filter lists cannot be reliably parsed, so be
+                            permissive (otherwise mandatory filters such as
+                            ``company`` on General Ledger get silently dropped
+                            and ERPNext raises "Company is mandatory").
+
+        * Query Report   -> ``%(x)s`` substitution in the SQL string; unknown
+                            placeholders are simply unused.  Permissive.
+
+        * Report Builder -> ``frappe.get_list(doctype, filters=...)``, which
+                            turns every key into ``tabX.field = value``.  An
+                            unknown key becomes
+                            ``Unknown column 'tabX.field' in 'WHERE'``.
+                            Restrict to columns that actually exist on the
+                            report's DocType.
         """
         try:
-            report_type = frappe.db.get_value("Report", self.report, "report_type")
+            report = frappe.get_doc("Report", self.report)
+            report_type = report.report_type
 
-            # This is the parser you already ship in this module.
-            definitions = get_report_filters(self.report) or []
-
-            # Script Reports keep their filters in JS. An empty parse result is
-            # ambiguous ("no filters" vs "couldn't read the JS"), so stay
-            # permissive instead of silently stripping valid filters.
-            if not definitions and report_type == "Script Report":
-                logger.warning(
-                    f"Could not read filters for Script Report {self.report} | "
-                    f"name={self.name} — passing filters through unchanged"
+            # ---- Script Report / Query Report: permissive ------------------
+            if report_type != "Report Builder":
+                logger.info(
+                    f"Permissive filters for {report_type} | "
+                    f"name={self.name} | report={self.report}"
                 )
                 return None
 
-            fieldnames = {
-                d.get("fieldname")
-                for d in definitions
-                if isinstance(d, dict) and d.get("fieldname")
-            }
+            # ---- Report Builder: restrict to valid DocType columns ----------
+            ref_doctype = report.ref_doctype
+            if not ref_doctype:
+                return None
+
+            meta = frappe.get_meta(ref_doctype)
+            valid = set(meta.get_valid_columns() or [])
+            valid.add("name")  # primary key isn't in get_valid_columns()
+            # valid.update(_REPORT_BUILDER_PSEUDO_FILTERS)    
+
+            # Allow anything the report explicitly declares as a filter
+            for row in report.get("filters") or []:
+                fn = row.get("fieldname")
+                if fn:
+                    valid.add(fn)
 
             logger.info(
-                f"Supported filters resolved | name={self.name} | "
-                f"report={self.report} | supported={sorted(fieldnames)}"
+                f"Report Builder valid filters resolved | name={self.name} | "
+                f"report={self.report} | doctype={ref_doctype} | "
+                f"count={len(valid)}"
             )
-            return fieldnames
+            return valid
 
         except Exception:
             logger.exception(
@@ -402,12 +424,19 @@ class ReportEmailScheduled(Document):
 
     def export_report(self, filters):
         """
-        Runs the report via get_report_data() and converts the resulting rows
-        into an XLSX file. Always returns (report_name, extension, content),
-        even when the report has no rows (headers-only file).
+        Runs the report and converts the resulting rows into an XLSX file.
 
-        Raises only when the report execution itself fails.
+        * Header labels come from the Report document's declared columns
+        (Report Builder `fields`, Query/Script Report `columns` child table).
+        * Frappe's auto-injected audit columns (docstatus, modified,
+        modified_by, …) are dropped from Report Builder exports.
+        * If ``group_by`` is present in ``filters``, rows are aggregated into
+        a two-column (group value, count) table — matching the report's
+        "Group By …" view.
         """
+        filters = dict(filters or {})
+        group_by = filters.pop("group_by", None)
+        
         try:
             result = get_report_data(self.report, filters)
         except Exception:
@@ -417,46 +446,139 @@ class ReportEmailScheduled(Document):
             )
             raise
 
-        rows    = result.get("data") or []
-        columns = result.get("columns") or []
-        col_defs = result.get("column_definitions") or []
+        rows         = result.get("data") or []
+        columns      = result.get("columns") or []
+        col_defs     = result.get("column_definitions") or []
+        report_type  = result.get("report_type")
+        is_rb        = report_type == "Report Builder"
 
-        # Prefer the pretty label from column_definitions when available,
-        # otherwise fall back to the fieldname.
-        header = [
-            (col_defs[i].get("label") or col_defs[i].get("fieldname"))
-            if i < len(col_defs) else col
-            for i, col in enumerate(columns)
-        ]
+        declared     = self._get_report_declared_columns()
+        use_declared = bool(declared)
 
-        if not rows:
+        
+
+        # ===================================================================
+        # Branch A — grouped output
+        # ===================================================================
+        if group_by and rows:
+            group_label = declared.get(group_by, {}).get("label") or group_by
+
+            # Runtime column list vs. declared field list, both with
+            # Frappe's noise fields removed, are positionally aligned.
+            # Use that to translate "reason_for_contact" (declared) into
+            # "DocField(df6bd4078b)" (runtime key).
+            declared_pairs = [
+                (fn, info["label"]) for fn, info in declared.items()
+                if fn not in _REPORT_BUILDER_NOISE_FIELDS
+            ]
+            runtime_cols = [
+                c for c in columns
+                if c not in _REPORT_BUILDER_NOISE_FIELDS
+            ]
+
+            group_col_key = None
+            for (fn, _lbl), col in zip(declared_pairs, runtime_cols):
+                if fn == group_by:
+                    group_col_key = col
+                    break
+
+            # Fallbacks, in case zip alignment fails for some reason.
+            if group_col_key is None:
+                if group_by in columns:
+                    group_col_key = group_by          # Query/Script path
+                elif group_by in declared:
+                    # Walk declared by index, pick the same index from columns.
+                    fn_index = list(declared.keys()).index(group_by)
+                    if fn_index < len(columns):
+                        group_col_key = columns[fn_index]
+
             logger.info(
-                f"No rows returned for report | "
-                f"name={self.name} | report={self.report} | "
-                f"sending header-only XLSX"
+                f"Grouped export | name={self.name} | "
+                f"group_by={group_by!r} -> runtime key={group_col_key!r} | "
+                f"declared_pairs={[fn for fn, _ in declared_pairs]} | "
+                f"runtime_cols={runtime_cols}"
             )
-            # Fall back to a placeholder header if the report exposes no columns
-            # (shouldn't happen for Script Reports, but keeps the file non-empty).
-            table = [header or ["No data"]]
-        else:
-            if not header:
-                # Last-resort: derive header from the first row
-                header = list(rows[0].keys())
-            table = [header]
-            for row in rows:
-                table.append([row.get(col) for col in columns])
 
+            counts = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get(group_col_key)
+                counts[value] = counts.get(value, 0) + 1
+
+            ordered = sorted(
+                counts.items(),
+                key=lambda kv: (kv[0] in (None, ""), -kv[1]),
+            )
+            table = [[group_label, "Count"]] + [[v, c] for v, c in ordered]
+
+        # ===================================================================
+        # Branch B — normal (ungrouped) output
+        # ===================================================================
+        else:
+            header    = []
+            keep_cols = []
+
+            if is_rb:
+                runtime_cols = [
+                    c for c in columns
+                    if c not in _REPORT_BUILDER_NOISE_FIELDS
+                ]
+                declared_pairs = [
+                    (fn, info["label"]) for fn, info in declared.items()
+                    if fn not in _REPORT_BUILDER_NOISE_FIELDS
+                ]
+
+                if declared_pairs and len(runtime_cols) == len(declared_pairs):
+                    for (_fn, label), col in zip(declared_pairs, runtime_cols):
+                        header.append(label)
+                        keep_cols.append(col)
+                else:
+                    for i, col in enumerate(runtime_cols):
+                        label = declared.get(col, {}).get("label")
+                        if not label and i < len(col_defs):
+                            label = col_defs[i].get("label")
+                        header.append(label or col)
+                        keep_cols.append(col)
+            else:
+                for i, col in enumerate(columns):
+                    if col in _FRAPPE_AUTO_COLUMNS and col not in declared:
+                        continue
+                    label = None
+                    if col in declared:
+                        label = declared[col].get("label")
+                    if not label and i < len(col_defs):
+                        label = col_defs[i].get("label")
+                    header.append(label or col)
+                    keep_cols.append(col)
+
+            if not rows:
+                table = [header or ["No data"]]
+            else:
+                if not header:
+                    header    = list(rows[0].keys())
+                    keep_cols = header
+                table = [header] + [
+                    [row.get(col) for col in keep_cols] for row in rows
+                ]
+
+        # ===================================================================
+        # Emit XLSX
+        # ===================================================================
         from frappe.utils.xlsxutils import make_xlsx
 
         xlsx_file = make_xlsx(table, self.report)
         content   = xlsx_file.getvalue()
 
         logger.info(
-            f"XLSX built | name={self.name} | rows={len(rows)} | "
+            f"XLSX built | name={self.name} | report={self.report} | "
+            f"rows={len(rows)} | grouped={bool(group_by)} | "
             f"bytes={len(content)}"
         )
 
         return self.report, "xlsx", content
+
+
 
     def send_scheduled_report(self):
         if not self.enable:
@@ -481,6 +603,10 @@ class ReportEmailScheduled(Document):
         except Exception:
             logger.exception(
                 f"Report execution failed, skipping email | name={self.name}"
+            )
+            frappe.log_error(
+                message=frappe.get_traceback(),
+                title=f"Scheduled Report Failed: {self.name}",
             )
             self._safe_set_value(
                 self.doctype, self.name, "last_execution", now_datetime()
@@ -583,6 +709,91 @@ class ReportEmailScheduled(Document):
                 f"Failed to strip CC from Email Queue | name={self.name} | cc={cc}"
             )
         
+        
+    def _get_report_declared_columns(self):
+        """
+        Return {fieldname: {"fieldname","label","fieldtype","options"}} for the
+        columns declared on the Report document.
+
+        * Query / Script Reports: columns live in the `columns` child table.
+        * Report Builder reports : columns live in json.fields as
+        [[fieldname, doctype], ...] and labels must be resolved from the
+        doctype's meta.
+        """
+        try:
+            report_doc = frappe.get_doc("Report", self.report)
+        except Exception:
+            logger.exception(
+                f"Could not load Report doc | report={self.report} | name={self.name}"
+            )
+            return {}
+
+        declared = {}
+
+        def _add(fieldname, label, fieldtype=None, options=None):
+            if not fieldname:
+                return
+            declared.setdefault(
+                fieldname,
+                {
+                    "fieldname": fieldname,
+                    "label": label or fieldname,
+                    "fieldtype": fieldtype,
+                    "options": options,
+                },
+            )
+
+        # 1. columns child table (Query Report / Script Report)
+        for row in report_doc.get("columns") or []:
+            _add(row.get("fieldname"), row.get("label"),
+                row.get("fieldtype"), row.get("options"))
+
+        # 2. Report Builder -> json.fields = [[fieldname, doctype], ...]
+        if report_doc.report_type == "Report Builder" and report_doc.get("json"):
+            try:
+                payload = report_doc.json
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+
+                for entry in (payload or {}).get("fields") or []:
+                    if isinstance(entry, (list, tuple)) and entry:
+                        fieldname = entry[0]
+                        doctype = entry[1] if len(entry) > 1 else report_doc.ref_doctype
+                    elif isinstance(entry, dict):
+                        fieldname = entry.get("fieldname")
+                        doctype = entry.get("parent") or report_doc.ref_doctype
+                    else:
+                        continue
+
+                    label = _REPORT_BUILDER_LABEL_OVERRIDES.get(fieldname)
+                    fieldtype = None
+                    options = None
+
+                    if not label and doctype:
+                        try:
+                            meta = frappe.get_meta(doctype)
+                            field = meta.get_field(fieldname)
+                            if field:
+                                label = field.label
+                                fieldtype = field.fieldtype
+                                options = field.options
+                        except Exception:
+                            logger.warning(
+                                f"Could not resolve label for {doctype}.{fieldname}"
+                            )
+
+                    _add(fieldname, label, fieldtype, options)
+            except Exception:
+                logger.exception(
+                    f"Could not parse Report Builder json | report={self.report}"
+                )
+
+        logger.info(
+            f"Declared columns resolved | name={self.name} | "
+            f"report={self.report} | count={len(declared)} | "
+            f"labels={[v['label'] for v in list(declared.values())[:5]]}"
+        )
+        return declared
         
         
 import frappe
@@ -780,7 +991,14 @@ def get_report_data(
 
     # ---- 2. fill in whatever is missing ---------------------------------
     if apply_defaults:
-        _apply_defaults(report_name, filters, filter_definitions, extra_defaults)
+        if apply_defaults:
+            _apply_defaults(
+                report_name,
+                filters,
+                filter_definitions,
+                extra_defaults,
+                report_type=report.report_type,      # <-- MUST be here
+            )
 
     # ---- 3. sanity check -------------------------------------------------
     missing = _missing_required_filters(filters, filter_definitions)
@@ -888,8 +1106,10 @@ def _resolve_default(value):
     return value
 
 
-def _apply_defaults(report_name, filters, definitions, extra_defaults=None):
-    """Mutate ``filters`` in place, filling every blank/None value.
+def _apply_defaults(report_name, filters, definitions, extra_defaults=None,
+                    report_type=None):
+    """
+    Mutate ``filters`` in place, filling every blank / None value.
 
     Priority (lowest -> highest):
         generic name based defaults
@@ -898,20 +1118,22 @@ def _apply_defaults(report_name, filters, definitions, extra_defaults=None):
         -> extra_defaults passed to this call
         -> filters passed by the caller (never overwritten)
 
-    Generic and report-specific defaults are only applied for fieldnames
-    that the report actually declares (i.e. present in ``definitions``).
-    Injecting, say, ``company`` into a Query Report whose SQL has no
-    ``company`` column raises
-    ``Unknown column 'tabX.company' in 'WHERE'`` at execution time.
+    Report Builder reports get an additional guard: generic / report-specific
+    defaults are only applied for fieldnames the report actually declares,
+    because ``frappe.get_list`` will turn unknown keys into SQL columns.
     """
     declared = set(definitions.keys())
-
     layer = {}
 
-    # 1. Generic defaults — gated by the report's declared filters
-    for fieldname, value in COMMON_FILTER_DEFAULTS.items():
-        if fieldname in declared:
-            layer[fieldname] = value
+    # 1. Generic defaults
+    if report_type == "Report Builder":
+        # Restrictive: only apply defaults the report actually declares.
+        for fieldname, value in COMMON_FILTER_DEFAULTS.items():
+            if fieldname in declared:
+                layer[fieldname] = value
+    else:
+        # Script / Query reports: unknown filter keys are harmless.
+        layer.update(COMMON_FILTER_DEFAULTS)
 
     # 2. Defaults declared on the Report doc itself
     for fieldname, definition in definitions.items():
@@ -919,17 +1141,17 @@ def _apply_defaults(report_name, filters, definitions, extra_defaults=None):
         if default not in (None, ""):
             layer[fieldname] = default
 
-    # 3. Report-specific defaults — gated as well
+    # 3. Report-specific defaults (already namespaced per report)
     for fieldname, value in (REPORT_SPECIFIC_DEFAULTS.get(report_name) or {}).items():
         if fieldname in declared:
             layer[fieldname] = value
 
-    # 4. Caller-supplied extra defaults — explicit intent, honour as-is
+    # 4. Caller-supplied extra defaults
     layer.update(extra_defaults or {})
 
     for fieldname, value in layer.items():
         if filters.get(fieldname) not in (None, ""):
-            continue  # caller already supplied something (0 and False count)
+            continue
         resolved = _resolve_default(value)
         if resolved is not None and resolved != "":
             filters[fieldname] = resolved
@@ -950,8 +1172,51 @@ def _missing_required_filters(filters, definitions):
 # 5. Execution
 # ---------------------------------------------------------------------------
 
-def _execute_report(report, report_name, filters, limit=None, ignore_prepared_report=True):
+def _execute_report(report, report_name, filters, limit=None,
+                    ignore_prepared_report=True):
     """Call ``Report.get_data`` with only the kwargs that build supports."""
+
+    # ------------------------------------------------------------------
+    # LAST-LINE DEFENCE for Report Builder reports.
+    #
+    # Report Builder is executed via frappe.get_list(doctype, filters=...),
+    # which turns *every* key in the filters dict into a SQL predicate
+    # ``tabX.field = value``.  Any key that is not a real column on the
+    # report's DocType raises:
+    #     Unknown column 'tabX.field' in 'WHERE'
+    #
+    # Upstream gating (get_filters / _apply_defaults) can miss this when
+    # the report type isn't threaded through, when get_valid_columns()
+    # raises, or when a caller passes filters directly.  Do the check
+    # here so no path can bypass it.
+    # ------------------------------------------------------------------
+    if report.report_type == "Report Builder":
+        ref_doctype = report.ref_doctype
+        if ref_doctype:
+            try:
+                meta = frappe.get_meta(ref_doctype)
+                valid = {f.fieldname for f in meta.fields if f.fieldname}
+                valid.add("name")
+                valid.update(_REPORT_BUILDER_PSEUDO_FILTERS)
+
+                dropped = sorted(k for k in filters if k not in valid)
+                if dropped:
+                    ...
+                    filters = {k: v for k, v in filters.items() if k in valid}
+            except Exception:
+                logger.exception(
+                    f"Could not validate filters against {ref_doctype} | "
+                    f"name={report_name} — passing through unchanged"
+                )
+
+    # Log exactly what is about to be executed, so future failures are
+    # one grep away.
+    logger.info(
+        f"Executing report | name={report_name} | "
+        f"type={report.report_type} | doctype={report.ref_doctype} | "
+        f"filters={filters}"
+    )
+
     wanted = {
         "filters": filters,
         "ignore_prepared_report": ignore_prepared_report,
@@ -971,7 +1236,6 @@ def _execute_report(report, report_name, filters, limit=None, ignore_prepared_re
         return report.get_data(**kwargs)
 
     except KeyError as exc:
-        # A Script Report most likely did filters.some_key on a missing key.
         key = exc.args[0] if exc.args else "unknown"
         message = _(
             "Report {0} could not run because the filter '{1}' was not supplied. "
@@ -979,7 +1243,9 @@ def _execute_report(report, report_name, filters, limit=None, ignore_prepared_re
             "`required_filters`."
         ).format(report_name, key)
         frappe.log_error(
-            "{0}\n\nFilters: {1}\n\n{2}".format(message, filters, frappe.get_traceback()),
+            "{0}\n\nFilters: {1}\n\n{2}".format(
+                message, filters, frappe.get_traceback()
+            ),
             "get_report_data",
         )
         raise frappe.ValidationError(message) from exc
@@ -1248,3 +1514,29 @@ def get_report_filters(report_name):
         return parsed_filters
     
     
+# Frappe appends these to every query-report result. They are not part of
+# the report definition and should not end up in the exported file unless
+# the report author explicitly added them.
+_FRAPPE_AUTO_COLUMNS = {
+    "docstatus", "modified", "modified_by", "creation", "owner", "idx",
+}
+
+
+# Report Builder stores columns as [fieldname, doctype] pairs in json.fields.
+# These three are auto-injected by Frappe for every Report Builder report —
+# the report author didn't add them, and they're almost never wanted in an
+# export.  Drop them regardless of whether the report's fields list contains
+# them.
+_REPORT_BUILDER_NOISE_FIELDS = {
+    "docstatus", "modified", "modified_by",
+    "creation", "owner", "idx",
+}
+
+# Report Builder pseudo-filters that are valid keys in the filters dict but
+# are NOT columns on the DocType.  The column whitelist must not strip them.
+_REPORT_BUILDER_PSEUDO_FILTERS = {"group_by", "sort_by", "order_by"}
+
+# Labels for fields that don't live in DocType meta.
+_REPORT_BUILDER_LABEL_OVERRIDES = {
+    "name": "ID",
+}
