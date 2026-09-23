@@ -4,6 +4,41 @@
 frappe.ui.form.on('Report Email Scheduled', {
 	refresh: function (frm) {
 		set_frequency_fields(frm);
+
+		if (!frm.is_new()) {
+			frm.add_custom_button(__('Send Now'), function () {
+				if (frm.is_dirty()) {
+					frappe.msgprint(__('Please save your changes before sending.'));
+					return;
+				}
+
+				frappe.confirm(
+					__('Are you sure you want to send this report email now to the configured recipients?'),
+					function () {
+						frappe.show_alert({
+							message: __('Sending report email...'),
+							indicator: 'blue'
+						});
+
+						frm.call({
+							doc: frm.doc,
+							method: 'send_now',
+							freeze: true,
+							freeze_message: __('Generating report and sending email...'),
+							callback: function (r) {
+								if (!r.exc) {
+									frappe.show_alert({
+										message: __('Report email sent successfully!'),
+										indicator: 'green'
+									});
+									frm.reload_doc();
+								}
+							}
+						});
+					}
+				);
+			}).addClass('btn-primary');
+		}
 	},
 	frequency: function (frm) {
 		set_frequency_fields(frm);

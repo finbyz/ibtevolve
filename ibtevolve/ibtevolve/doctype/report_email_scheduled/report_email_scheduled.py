@@ -7,6 +7,17 @@ from frappe.utils import (
     get_datetime,
     add_days,
     add_months,
+    add_to_date,
+    getdate,
+    today,
+    get_first_day,
+    get_last_day,
+    get_first_day_of_week,
+    get_last_day_of_week,
+    get_quarter_start,
+    get_quarter_ending,
+    get_year_start,
+    get_year_ending,
 )
 
 import logging
@@ -24,6 +35,99 @@ logger = frappe.logger(
     allow_site=True,
     file_count=5,
 )
+
+
+def resolve_date_range(date_range_val):
+    """
+    Returns (from_date, to_date) as 'YYYY-MM-DD' strings for a given date_range option.
+    Supported options:
+    - Today
+    - Yesterday
+    - This Week
+    - Last Week
+    - This Month
+    - Last Month
+    - This Quarter
+    - Last Quarter / Last Quater
+    - This Year
+    - Last Year
+    - Custom comma-separated: "2026-09-01, 2026-09-30"
+    - Single date string: "2026-09-15" -> ("2026-09-15", "2026-09-15")
+    """
+    if not date_range_val:
+        return None, None
+
+    date_range_val = str(date_range_val).strip()
+
+    if "," in date_range_val:
+        parts = [p.strip() for p in date_range_val.split(",") if p.strip()]
+        if len(parts) >= 2:
+            return str(getdate(parts[0])), str(getdate(parts[1]))
+        elif len(parts) == 1:
+            d = str(getdate(parts[0]))
+            return d, d
+
+    val_lower = date_range_val.lower().replace("quater", "quarter")
+
+    # Try frappe.utils.data.get_timespan_date_range first
+    try:
+        from frappe.utils.data import get_timespan_date_range
+        res = get_timespan_date_range(val_lower)
+        if res and len(res) == 2:
+            return str(getdate(res[0])), str(getdate(res[1]))
+    except Exception:
+        pass
+
+    # Fallback / manual calculation
+    today_dt = getdate(today())
+
+    if val_lower == "today":
+        return str(today_dt), str(today_dt)
+    elif val_lower == "yesterday":
+        yest = add_days(today_dt, -1)
+        return str(getdate(yest)), str(getdate(yest))
+    elif val_lower == "this week":
+        start = get_first_day_of_week(today_dt)
+        end = get_last_day_of_week(today_dt)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "last week":
+        prev_week = add_days(today_dt, -7)
+        start = get_first_day_of_week(prev_week)
+        end = get_last_day_of_week(prev_week)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "this month":
+        start = get_first_day(today_dt)
+        end = get_last_day(today_dt)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "last month":
+        prev_month = add_months(today_dt, -1)
+        start = get_first_day(prev_month)
+        end = get_last_day(prev_month)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "this quarter":
+        start = get_quarter_start(today_dt)
+        end = get_quarter_ending(today_dt)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "last quarter":
+        prev_q = add_months(today_dt, -3)
+        start = get_quarter_start(prev_q)
+        end = get_quarter_ending(prev_q)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "this year":
+        start = get_year_start(today_dt)
+        end = get_year_ending(today_dt)
+        return str(getdate(start)), str(getdate(end))
+    elif val_lower == "last year":
+        prev_y = add_to_date(today_dt, years=-1)
+        start = get_year_start(prev_y)
+        end = get_year_ending(prev_y)
+        return str(getdate(start)), str(getdate(end))
+
+    try:
+        d = str(getdate(date_range_val))
+        return d, d
+    except Exception:
+        return None, None
 
 
 class ReportEmailScheduled(Document):
@@ -215,6 +319,17 @@ class ReportEmailScheduled(Document):
         """
         filter_dict = {}
 
+        report_doc = None
+        report_type = None
+        ref_doctype = None
+        if self.report and frappe.db.exists("Report", self.report):
+            try:
+                report_doc = frappe.get_doc("Report", self.report)
+                report_type = report_doc.report_type
+                ref_doctype = report_doc.ref_doctype
+            except Exception:
+                pass
+
         supported = self._get_supported_filters()
         restrict = supported is not None
 
@@ -244,27 +359,88 @@ class ReportEmailScheduled(Document):
         if self.get("group_by"):                      # <-- ADD THESE 2 LINES
             filter_dict["group_by"] = self.group_by
 
-        # 3. Date range -> from_date / to_date
+        # 3. Date range -> from_date / to_date or Report Builder date field
         if self.get("date_range"):
-            date_val = self.date_range
-
-            if date_val == "Today":
-                today = frappe.utils.today()
-                _add("from_date", today)
-                _add("to_date", today)
-            elif isinstance(date_val, str) and "," in date_val:
-                from_date, to_date = date_val.split(",")
-                _add("from_date", from_date.strip())
-                _add("to_date", to_date.strip())
-            else:
-                _add("from_date", date_val)
-                _add("to_date", date_val)
+            from_date, to_date = resolve_date_range(self.date_range)
+            if from_date and to_date:
+                if report_type == "Report Builder" and ref_doctype:
+                    date_field = self._get_report_builder_date_field(report_doc, ref_doctype)
+                    if date_field:
+                        filter_dict[date_field] = ["between", [from_date, to_date]]
+                    else:
+                        _add("from_date", from_date)
+                        _add("to_date", to_date)
+                else:
+                    _add("from_date", from_date)
+                    _add("to_date", to_date)
 
         logger.info(
             f"Filters built for schedule | name={self.name} | "
             f"report={self.report} | restrict={restrict} | filters={filter_dict}"
         )
         return filter_dict
+
+    def _get_report_builder_date_field(self, report_doc, ref_doctype):
+        """
+        Determine the appropriate Date/Datetime column on ref_doctype
+        to apply the date range filter to for a Report Builder report.
+        """
+        if not ref_doctype:
+            return None
+
+        try:
+            meta = frappe.get_meta(ref_doctype)
+        except Exception:
+            return None
+
+        # 1. If child table filters contains a Date / Datetime field on ref_doctype
+        for row in self.get("filters") or []:
+            fn = row.get("fieldname")
+            if fn:
+                df = meta.get_field(fn)
+                if df and df.fieldtype in ("Date", "Datetime"):
+                    return fn
+
+        # 2. Check saved filters in report_doc.json
+        if report_doc and report_doc.get("json"):
+            try:
+                payload = report_doc.json
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                for sf in (payload or {}).get("filters") or []:
+                    if isinstance(sf, (list, tuple)) and len(sf) >= 2:
+                        fn = sf[1]
+                        df = meta.get_field(fn)
+                        if df and df.fieldtype in ("Date", "Datetime"):
+                            return fn
+            except Exception:
+                pass
+
+        # 3. If ref_doctype has from_date and to_date
+        if meta.has_field("from_date") and meta.has_field("to_date"):
+            return None
+
+        # 4. Standard common date fieldnames on ref_doctype
+        common_date_fields = [
+            "posting_date",
+            "transaction_date",
+            "date_of_call",
+            "date",
+            "order_date",
+            "invoice_date",
+            "bill_date",
+            "creation",
+        ]
+        for fn in common_date_fields:
+            if fn == "creation" or meta.has_field(fn):
+                return fn
+
+        # 5. First Date or Datetime field on DocType
+        for f in meta.fields:
+            if f.fieldtype in ("Date", "Datetime"):
+                return f.fieldname
+
+        return "creation"
 
 
     def _get_supported_filters(self):
@@ -644,6 +820,59 @@ class ReportEmailScheduled(Document):
             f"Execution information updated | name={self.name} | "
             f"last={execution_time} | next={next_execution}"
         )
+
+    @frappe.whitelist()
+    def send_now(self):
+        """Send the scheduled report immediately on manual trigger."""
+        try:
+            frappe.db.sql("SET SESSION wait_timeout = 7200")
+            frappe.db.sql("SET SESSION interactive_timeout = 7200")
+        except Exception as e:
+            logger.warning(f"Could not set session timeouts: {e}")
+
+        filters = self.get_filters()
+        logger.info(
+            f"Manual 'Send Now' triggered | "
+            f"name={self.name} | report={self.report} | filters={filters}"
+        )
+
+        try:
+            report_name, extension, content = self.export_report(filters)
+        except Exception:
+            logger.exception(
+                f"Manual report execution failed | name={self.name}"
+            )
+            frappe.log_error(
+                message=frappe.get_traceback(),
+                title=f"Manual Report Send Failed: {self.name}",
+            )
+            frappe.throw(frappe._("Failed to generate report. Please check Error Log."))
+
+        self.send_report_email(report_name, extension, content)
+        logger.info(f"Manual email sent successfully | name={self.name}")
+
+        execution_time = now_datetime()
+        try:
+            frappe.db.commit()
+        except Exception:
+            pass
+
+        self._safe_set_value(
+            self.doctype,
+            self.name,
+            "last_execution",
+            execution_time,
+        )
+
+        try:
+            frappe.db.commit()
+        except Exception:
+            pass
+
+        return {
+            "status": "success",
+            "message": frappe._("Report email has been sent successfully."),
+        }
         
     def get_cc(self):
         """Parse the comma/newline separated `cc` field into a clean list."""
@@ -1156,6 +1385,19 @@ def _apply_defaults(report_name, filters, definitions, extra_defaults=None,
         if resolved is not None and resolved != "":
             filters[fieldname] = resolved
 
+    if "start_date" in declared and filters.get("start_date") in (None, "") and filters.get("from_date"):
+        filters["start_date"] = filters["from_date"]
+    if "end_date" in declared and filters.get("end_date") in (None, "") and filters.get("to_date"):
+        filters["end_date"] = filters["to_date"]
+    if "period_start_date" in declared and filters.get("period_start_date") in (None, "") and filters.get("from_date"):
+        filters["period_start_date"] = filters["from_date"]
+    if "period_end_date" in declared and filters.get("period_end_date") in (None, "") and filters.get("to_date"):
+        filters["period_end_date"] = filters["to_date"]
+    if "report_date" in declared and filters.get("report_date") in (None, "") and filters.get("to_date"):
+        filters["report_date"] = filters["to_date"]
+    if "as_on_date" in declared and filters.get("as_on_date") in (None, "") and filters.get("to_date"):
+        filters["as_on_date"] = filters["to_date"]
+
 
 def _missing_required_filters(filters, definitions):
     missing = []
@@ -1208,6 +1450,22 @@ def _execute_report(report, report_name, filters, limit=None,
                     f"Could not validate filters against {ref_doctype} | "
                     f"name={report_name} — passing through unchanged"
                 )
+
+        if report.get("json"):
+            try:
+                params = json.loads(report.json)
+                saved_filters = params.get("filters") or []
+                cleaned_filters = []
+                for sf in saved_filters:
+                    if isinstance(sf, (list, tuple)) and len(sf) >= 2:
+                        fn = sf[1]
+                        if fn in filters:
+                            continue
+                    cleaned_filters.append(sf)
+                params["filters"] = cleaned_filters
+                report.json = json.dumps(params)
+            except Exception:
+                pass
 
     # Log exactly what is about to be executed, so future failures are
     # one grep away.
