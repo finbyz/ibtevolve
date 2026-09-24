@@ -1,6 +1,8 @@
 import json
 import time
+from io import BytesIO
 import frappe
+from frappe import _
 from frappe.model.document import Document
 from frappe.utils import (
     now_datetime,
@@ -18,10 +20,24 @@ from frappe.utils import (
     get_quarter_ending,
     get_year_start,
     get_year_ending,
+    cint,
+    cstr,
+    flt,
+    strip_html,
 )
 
 import logging
 import cssutils
+from openpyxl import Workbook
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+DATE_FIELDTYPES = {"Date"}
+DATETIME_FIELDTYPES = {"Datetime"}
+NUMERIC_FIELDTYPES = {"Int", "Float", "Currency", "Percent"}
+CHECK_FIELDTYPES = {"Check"}
 
 # cssutils logs a Python-level ERROR for CSS it can't parse (e.g. 8-digit
 # hex colors like #0000001a used for RGBA). These are non-fatal — the
@@ -686,14 +702,26 @@ class ReportEmailScheduled(Document):
                 counts.items(),
                 key=lambda kv: (kv[0] in (None, ""), -kv[1]),
             )
-            table = [[group_label, "Count"]] + [[v, c] for v, c in ordered]
+            labels = [group_label, "Count"]
+            fieldnames = ["group_val", "count"]
+            fieldtypes = [declared.get(group_by, {}).get("fieldtype") or "Data", "Int"]
+            export_rows = [{"group_val": v, "count": c} for v, c in ordered]
 
         # ===================================================================
         # Branch B — normal (ungrouped) output
         # ===================================================================
         else:
-            header    = []
-            keep_cols = []
+            labels = []
+            fieldnames = []
+            fieldtypes = []
+
+            col_def_by_fn = {}
+            for cd in col_defs:
+                if isinstance(cd, dict):
+                    if cd.get("fieldname"):
+                        col_def_by_fn[cd["fieldname"]] = cd
+                    if cd.get("label"):
+                        col_def_by_fn[cd["label"]] = cd
 
             if is_rb:
                 runtime_cols = [
@@ -706,49 +734,200 @@ class ReportEmailScheduled(Document):
                 ]
 
                 if declared_pairs and len(runtime_cols) == len(declared_pairs):
-                    for (_fn, label), col in zip(declared_pairs, runtime_cols):
-                        header.append(label)
-                        keep_cols.append(col)
+                    for (fn, label), col in zip(declared_pairs, runtime_cols):
+                        labels.append(label)
+                        fieldnames.append(col)
+                        ftype = declared.get(fn, {}).get("fieldtype") or col_def_by_fn.get(col, {}).get("fieldtype") or "Data"
+                        fieldtypes.append(ftype)
                 else:
                     for i, col in enumerate(runtime_cols):
-                        label = declared.get(col, {}).get("label")
+                        info = declared.get(col, {})
+                        label = info.get("label")
+                        ftype = info.get("fieldtype")
                         if not label and i < len(col_defs):
                             label = col_defs[i].get("label")
-                        header.append(label or col)
-                        keep_cols.append(col)
+                            ftype = ftype or col_defs[i].get("fieldtype")
+                        labels.append(label or col)
+                        fieldnames.append(col)
+                        fieldtypes.append(ftype or "Data")
             else:
                 for i, col in enumerate(columns):
                     if col in _FRAPPE_AUTO_COLUMNS and col not in declared:
                         continue
-                    label = None
-                    if col in declared:
-                        label = declared[col].get("label")
+                    info = declared.get(col, {})
+                    label = info.get("label")
+                    ftype = info.get("fieldtype")
                     if not label and i < len(col_defs):
                         label = col_defs[i].get("label")
-                    header.append(label or col)
-                    keep_cols.append(col)
+                        ftype = ftype or col_defs[i].get("fieldtype")
+                    labels.append(label or col)
+                    fieldnames.append(col)
+                    fieldtypes.append(ftype or "Data")
 
-            if not rows:
-                table = [header or ["No data"]]
+            if not labels and rows and isinstance(rows[0], dict):
+                labels = list(rows[0].keys())
+                fieldnames = labels
+                fieldtypes = ["Data"] * len(labels)
+            elif not labels:
+                labels = ["No data"]
+                fieldnames = ["no_data"]
+                fieldtypes = ["Data"]
+
+            export_rows = rows
+
+        # ===================================================================
+        # Build Formatted XLSX Workbook
+        # ===================================================================
+        wb = Workbook()
+        ws = wb.active
+        sheet_title = (self.report or "Report")[:31]
+        for ch in ["\\", "/", "?", "*", ":", "[", "]"]:
+            sheet_title = sheet_title.replace(ch, "")
+        ws.title = sheet_title or "Report"
+
+        # ---------------- Theme & Styles ----------------
+        HEADER_BLUE = "4472C4"
+        WHITE = "FFFFFF"
+
+        header_font = Font(name="Calibri", bold=True, color=WHITE, size=10)
+        header_fill = PatternFill("solid", fgColor=HEADER_BLUE)
+        thin = Side(style="thin", color="B7C6E3")
+        thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left_align = Alignment(horizontal="left", vertical="center")
+        right_align = Alignment(horizontal="right", vertical="center")
+
+        n_cols = max(len(labels), 1)
+        last_col_letter = get_column_letter(n_cols)
+
+        # ---------------- Header Row ----------------
+        header_row_idx = 1
+        for idx, label in enumerate(labels, start=1):
+            cell = ws.cell(row=header_row_idx, column=idx, value=label)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = thin_border
+        ws.row_dimensions[header_row_idx].height = 22
+
+        # Start max_width calculation with header label length + padding (extra for table filter arrows)
+        max_width = [len(str(lbl or "")) + 5 for lbl in labels]
+
+        # ---------------- Data Rows ----------------
+        start_data_row = header_row_idx + 1
+        for r_idx, row in enumerate(export_rows):
+            if isinstance(row, dict):
+                values = [row.get(fn, "") for fn in fieldnames]
+            elif isinstance(row, (list, tuple)):
+                values = [row[i] if i < len(row) else "" for i in range(len(fieldnames))]
             else:
-                if not header:
-                    header    = list(rows[0].keys())
-                    keep_cols = header
-                table = [header] + [
-                    [row.get(col) for col in keep_cols] for row in rows
-                ]
+                values = [row]
 
-        # ===================================================================
-        # Emit XLSX
-        # ===================================================================
-        from frappe.utils.xlsxutils import make_xlsx
+            excel_row_idx = start_data_row + r_idx
 
-        xlsx_file = make_xlsx(table, self.report)
-        content   = xlsx_file.getvalue()
+            for c_idx, (value, ftype) in enumerate(zip(values, fieldtypes), start=1):
+                if isinstance(value, bool):
+                    value = "Yes" if value else "No"
+                elif ftype in CHECK_FIELDTYPES and value in (1, 0, "1", "0"):
+                    value = "Yes" if cint(value) else "No"
+
+                cell = ws.cell(row=excel_row_idx, column=c_idx)
+
+                if value is None or value == "":
+                    cell.value = ""
+                    cell.alignment = left_align
+                elif ftype in ("Currency", "Float"):
+                    try:
+                        cell.value = flt(value, 2)
+                        cell.number_format = "#,##0.00"
+                    except Exception:
+                        cell.value = value
+                    cell.alignment = right_align
+                elif ftype == "Percent":
+                    try:
+                        val_flt = flt(value, 2)
+                        cell.value = val_flt / 100.0 if abs(val_flt) > 1 else val_flt
+                        cell.number_format = "0.00%"
+                    except Exception:
+                        cell.value = value
+                    cell.alignment = right_align
+                elif ftype == "Int":
+                    try:
+                        cell.value = cint(value)
+                        cell.number_format = "#,##0"
+                    except Exception:
+                        cell.value = value
+                    cell.alignment = right_align
+                elif ftype in DATE_FIELDTYPES and value:
+                    try:
+                        cell.value = getdate(value)
+                        cell.number_format = "dd-mm-yyyy"
+                    except Exception:
+                        cell.value = cstr(value)
+                    cell.alignment = center
+                elif ftype in DATETIME_FIELDTYPES and value:
+                    try:
+                        cell.value = get_datetime(value)
+                        cell.number_format = "dd-mm-yyyy hh:mm"
+                    except Exception:
+                        cell.value = cstr(value)
+                    cell.alignment = center
+                else:
+                    if isinstance(value, str) and ("<" in value and ">" in value):
+                        value = strip_html(value)
+                    cell.value = value
+                    cell.alignment = left_align
+
+                cell.border = thin_border
+
+                text_value = cstr(cell.value if cell.value is not None else "")
+                if len(text_value) + 3 > max_width[c_idx - 1]:
+                    max_width[c_idx - 1] = min(len(text_value) + 3, 50)
+
+        # ---------------- Column Widths ----------------
+        for idx, width in enumerate(max_width, 1):
+            ws.column_dimensions[get_column_letter(idx)].width = min(max(width, 12), 50)
+
+        # ---------------- Freeze Header Row ----------------
+        ws.freeze_panes = f"A{start_data_row}"
+
+        # ---------------- Native Excel Table (filters + banded rows) ----------------
+        last_row = start_data_row + len(export_rows) - 1
+        if export_rows and n_cols > 0 and last_row >= start_data_row:
+            clean_name = "".join(ch for ch in (self.report or "Report") if ch.isalnum())[:16]
+            table_name = f"Tbl_{clean_name}_{int(time.time())}"
+            table = Table(
+                displayName=table_name,
+                ref=f"A{header_row_idx}:{last_col_letter}{last_row}",
+            )
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium9",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            ws.add_table(table)
+
+            # negative numbers highlighted in red, for any numeric column
+            red_font = Font(color="C00000")
+            for c_idx, ftype in enumerate(fieldtypes, start=1):
+                if ftype in NUMERIC_FIELDTYPES:
+                    col_letter = get_column_letter(c_idx)
+                    rng = f"{col_letter}{start_data_row}:{col_letter}{last_row}"
+                    ws.conditional_formatting.add(
+                        rng, CellIsRule(operator="lessThan", formula=["0"], font=red_font)
+                    )
+
+        # ---------------- Save to Buffer ----------------
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        content = buffer.getvalue()
 
         logger.info(
             f"XLSX built | name={self.name} | report={self.report} | "
-            f"rows={len(rows)} | grouped={bool(group_by)} | "
+            f"rows={len(export_rows)} | grouped={bool(group_by)} | "
             f"bytes={len(content)}"
         )
 
