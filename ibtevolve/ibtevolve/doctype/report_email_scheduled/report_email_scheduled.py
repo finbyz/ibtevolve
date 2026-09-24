@@ -38,6 +38,17 @@ DATE_FIELDTYPES = {"Date"}
 DATETIME_FIELDTYPES = {"Datetime"}
 NUMERIC_FIELDTYPES = {"Int", "Float", "Currency", "Percent"}
 CHECK_FIELDTYPES = {"Check"}
+TEXT_FIELDTYPES = {
+    "Small Text",
+    "Text Editor",
+    "Text",
+    "Long Text",
+    "Code",
+    "HTML Editor",
+    "Markdown Editor",
+    "HTML",
+    "Comment",
+}
 
 # cssutils logs a Python-level ERROR for CSS it can't parse (e.g. 8-digit
 # hex colors like #0000001a used for RGBA). These are non-fatal — the
@@ -796,6 +807,7 @@ class ReportEmailScheduled(Document):
         center = Alignment(horizontal="center", vertical="center", wrap_text=True)
         left_align = Alignment(horizontal="left", vertical="center")
         right_align = Alignment(horizontal="right", vertical="center")
+        data_center = Alignment(horizontal="center", vertical="center")
 
         n_cols = max(len(labels), 1)
         last_col_letter = get_column_letter(n_cols)
@@ -842,7 +854,7 @@ class ReportEmailScheduled(Document):
                         cell.number_format = "#,##0.00"
                     except Exception:
                         cell.value = value
-                    cell.alignment = right_align
+                    cell.alignment = data_center
                 elif ftype == "Percent":
                     try:
                         val_flt = flt(value, 2)
@@ -850,14 +862,14 @@ class ReportEmailScheduled(Document):
                         cell.number_format = "0.00%"
                     except Exception:
                         cell.value = value
-                    cell.alignment = right_align
+                    cell.alignment = data_center
                 elif ftype == "Int":
                     try:
                         cell.value = cint(value)
                         cell.number_format = "#,##0"
                     except Exception:
                         cell.value = value
-                    cell.alignment = right_align
+                    cell.alignment = data_center
                 elif ftype in DATE_FIELDTYPES and value:
                     try:
                         cell.value = getdate(value)
@@ -872,11 +884,19 @@ class ReportEmailScheduled(Document):
                     except Exception:
                         cell.value = cstr(value)
                     cell.alignment = center
-                else:
+                elif ftype in TEXT_FIELDTYPES:
                     if isinstance(value, str) and ("<" in value and ">" in value):
                         value = strip_html(value)
                     cell.value = value
                     cell.alignment = left_align
+                else:
+                    if isinstance(value, str) and ("<" in value and ">" in value):
+                        value = strip_html(value)
+                    cell.value = value
+                    if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://") or len(value) > 40):
+                        cell.alignment = left_align
+                    else:
+                        cell.alignment = data_center
 
                 cell.border = thin_border
 
