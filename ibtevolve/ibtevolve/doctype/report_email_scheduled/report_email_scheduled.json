@@ -23,6 +23,7 @@
   "next_execution",
   "last_execution",
   "column_break_utokn",
+  "subject",
   "recipients",
   "cc",
   "section_break_kyykh",
@@ -41,6 +42,12 @@
    "fieldtype": "Link",
    "label": "Report",
    "options": "Report"
+  },
+  {
+   "fieldname": "subject",
+   "fieldtype": "Data",
+   "label": "Subject",
+   "reqd": 1
   },
   {
    "fieldname": "recipients",
@@ -142,7 +149,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-16 12:53:22.641529",
+ "modified": "2026-09-24 13:46:00.000000",
  "modified_by": "Administrator",
  "module": "Ibtevolve",
  "name": "Report Email Scheduled",

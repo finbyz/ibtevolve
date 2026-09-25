@@ -189,6 +189,10 @@ class ReportEmailScheduled(Document):
             logger.error(f"Validation failed: Report missing | name={self.name}")
             frappe.throw("Please select a Report.")
 
+        if not self.get("subject"):
+            logger.error(f"Validation failed: Subject missing | name={self.name}")
+            frappe.throw("Please enter Subject.")
+
         if not self.recipients:
             logger.error(f"Validation failed: Recipients missing | name={self.name}")
             frappe.throw("Please add at least one recipient.")
@@ -594,9 +598,18 @@ class ReportEmailScheduled(Document):
                 <p>Regards,<br>ERPNext</p>
             """
 
+        subject = (self.get("subject") or "").strip()
+        if not subject:
+            subject = f"Scheduled Report - {self.report}"
+        else:
+            try:
+                subject = frappe.render_template(subject, {"doc": self})
+            except Exception:
+                pass
+
         sendmail_kwargs = {
             "recipients": recipients,
-            "subject": f"Scheduled Report - {self.report}",
+            "subject": subject,
             "message": message,
             "attachments": [{"fname": filename, "fcontent": content}],
             "reference_doctype": self.doctype,
